@@ -44,7 +44,35 @@
 #include <SPI.h>
 #endif
 
-#define VERSION_STRING  "1.0.0"
+// Make delta curves from many straight lines (linear interpolation).
+// This is a trade-off between visible corners (not enough segments)
+// and processor overload (too many expensive sqrt calls).
+#define DELTA_SEGMENTS_PER_SECOND 200
+
+// Center-to-center distance of the holes in the diagonal push rods.
+#define DELTA_DIAGONAL_ROD 269.0 // mm
+
+// Horizontal offset from middle of printer to smooth rod center.
+#define DELTA_SMOOTH_ROD_OFFSET 198.25 // mm
+
+// Horizontal offset of the universal joints on the end effector.
+#define DELTA_EFFECTOR_OFFSET 33.0 // mm
+
+// Horizontal offset of the universal joints on the carriages.
+#define DELTA_CARRIAGE_OFFSET 35.0 // mm
+
+// Effective horizontal distance bridged by diagonal push rods.
+#define DELTA_RADIUS (DELTA_SMOOTH_ROD_OFFSET-DELTA_EFFECTOR_OFFSET-DELTA_CARRIAGE_OFFSET)
+
+// Effective X/Y positions of the three vertical towers.
+#define SIN_60 0.8660254037844386
+#define COS_60 0.5
+#define DELTA_TOWER1_X -SIN_60*DELTA_RADIUS // front left tower
+#define DELTA_TOWER1_Y -COS_60*DELTA_RADIUS
+#define DELTA_TOWER2_X SIN_60*DELTA_RADIUS // front right tower
+#define DELTA_TOWER2_Y -COS_60*DELTA_RADIUS
+#define DELTA_TOWER3_X 0.0 // back middle tower
+#define DELTA_TOWER3_Y DELTA_RADIUS
 
 // look here for descriptions of gcodes: http://linuxcnc.org/handbook/gcode/g-code.html
 // http://objects.reprap.org/wiki/Mendel_User_Manual:_RepRapGCodes
@@ -1887,17 +1915,60 @@ void clamp_to_software_endstops(float target[3])
   }
 }
 
+void calculate_delta(float cartesian[3])
+{
+  delta[X_AXIS] = sqrt(sq(DELTA_DIAGONAL_ROD)
+		       - sq(DELTA_TOWER1_X-cartesian[X_AXIS])
+		       - sq(DELTA_TOWER1_Y-cartesian[Y_AXIS])
+		       ) + cartesian[Z_AXIS];
+  delta[Y_AXIS] = sqrt(sq(DELTA_DIAGONAL_ROD)
+		       - sq(DELTA_TOWER2_X-cartesian[X_AXIS])
+		       - sq(DELTA_TOWER2_Y-cartesian[Y_AXIS])
+		       ) + cartesian[Z_AXIS];
+  delta[Z_AXIS] = sqrt(sq(DELTA_DIAGONAL_ROD)
+		       - sq(DELTA_TOWER3_X-cartesian[X_AXIS])
+		       - sq(DELTA_TOWER3_Y-cartesian[Y_AXIS])
+		       ) + cartesian[Z_AXIS];
+  /*
+  SERIAL_ECHOPGM("cartesian x="); SERIAL_ECHO(cartesian[X_AXIS]);
+  SERIAL_ECHOPGM(" y="); SERIAL_ECHO(cartesian[Y_AXIS]);
+  SERIAL_ECHOPGM(" z="); SERIAL_ECHOLN(cartesian[Z_AXIS]);
+
+  SERIAL_ECHOPGM("delta x="); SERIAL_ECHO(delta[X_AXIS]);
+  SERIAL_ECHOPGM(" y="); SERIAL_ECHO(delta[Y_AXIS]);
+  SERIAL_ECHOPGM(" z="); SERIAL_ECHOLN(delta[Z_AXIS]);
+  */
+}
+
 void prepare_move()
 {
   clamp_to_software_endstops(destination);
 
   previous_millis_cmd = millis(); 
-  // Do not use feedmultiply for E or Z only moves
-  if( (current_position[X_AXIS] == destination [X_AXIS]) && (current_position[Y_AXIS] == destination [Y_AXIS])) {
-      plan_buffer_line(destination[X_AXIS], destination[Y_AXIS], destination[Z_AXIS], destination[E_AXIS], feedrate/60, active_extruder);
+
+  float difference[NUM_AXIS];
+  for (int8_t i=0; i < NUM_AXIS; i++) {
+    difference[i] = destination[i] - current_position[i];
   }
-  else {
-    plan_buffer_line(destination[X_AXIS], destination[Y_AXIS], destination[Z_AXIS], destination[E_AXIS], feedrate*feedmultiply/60/100.0, active_extruder);
+  float cartesian_mm = sqrt(sq(difference[X_AXIS]) +
+			    sq(difference[Y_AXIS]) +
+			    sq(difference[Z_AXIS]));
+  if (cartesian_mm < 0.000001) { cartesian_mm = abs(difference[E_AXIS]); }
+  if (cartesian_mm < 0.000001) { return; }
+  float seconds = 6000 * cartesian_mm / feedrate / feedmultiply;
+  int steps = max(1, int(DELTA_SEGMENTS_PER_SECOND * seconds));
+  SERIAL_ECHOPGM("mm="); SERIAL_ECHO(cartesian_mm);
+  SERIAL_ECHOPGM(" seconds="); SERIAL_ECHO(seconds);
+  SERIAL_ECHOPGM(" steps="); SERIAL_ECHOLN(steps);
+  for (int s = 1; s <= steps; s++) {
+    float fraction = float(s) / float(steps);
+    for(int8_t i=0; i < NUM_AXIS; i++) {
+      destination[i] = current_position[i] + difference[i] * fraction;
+    }
+    calculate_delta(destination);
+    plan_buffer_line(delta[X_AXIS], delta[Y_AXIS], delta[Z_AXIS],
+		     destination[E_AXIS], feedrate*feedmultiply/60/100.0,
+		     active_extruder);
   }
   for(int8_t i=0; i < NUM_AXIS; i++) {
     current_position[i] = destination[i];
